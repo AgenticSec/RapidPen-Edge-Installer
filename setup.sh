@@ -648,12 +648,16 @@ else
             # are present. Otherwise we write an empty placeholder so the
             # `@INCLUDE` in fluent-bit.conf still resolves.
             #
-            # Auth contract (Notion #744 + PR #1486): Edge MUST inject
-            # `_auth_token_hash: sha256:<hex>` as a record body field. We hash
-            # the plaintext token at config-render time and bake the hex into
-            # ingestor.conf. The plaintext token itself is sent only as the
-            # transport-level `Authorization: Bearer` header for ALB access
-            # logs — Cloud Lua does not consult it.
+            # Auth contract (Notion #744 + PR #1495 / #1496 / #1497):
+            # Cloud-side aggregator is fronted by the existing Hub API Gateway,
+            # which performs native API Key authentication. Edge sends the
+            # `{org_id}_{32-hex}` token verbatim in the `x-api-key` header;
+            # API Gateway VTL strips the trailing 33 chars to inject `org_id`
+            # server-side. No client-side hashing required.
+            #
+            # `log_ingest_endpoint` is a URI path (e.g. `/api/v1/edge-logs`).
+            # The host is reused from AGENTICSEC_BASEURL so Edge keeps a
+            # single trust anchor (the Hub API host).
             LOG_INGEST_ENDPOINT=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_ingest_endpoint // empty') || LOG_INGEST_ENDPOINT=""
             LOG_INGEST_API_TOKEN=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_ingest_api_token // empty') || LOG_INGEST_API_TOKEN=""
             INGESTOR_CONF_TEMPLATE="$SCRIPT_DIR/templates/ingestor.conf.template"
@@ -667,39 +671,23 @@ else
                     exit 1
                 fi
 
-                LOG_INGEST_HOST=$(echo "$LOG_INGEST_ENDPOINT" | sed -E 's|https?://([^/]+).*|\1|')
+                LOG_INGEST_HOST=$(echo "$AGENTICSEC_BASEURL" | sed -E 's|https?://([^/]+).*|\1|')
                 if [ -z "$LOG_INGEST_HOST" ]; then
-                    log_error "Could not parse host from log_ingest_endpoint: $LOG_INGEST_ENDPOINT"
+                    log_error "Could not parse host from AGENTICSEC_BASEURL: $AGENTICSEC_BASEURL"
                     cleanup_on_error
                     exit 1
                 fi
 
-                if command -v sha256sum >/dev/null 2>&1; then
-                    AUTH_TOKEN_HASH=$(printf '%s' "$LOG_INGEST_API_TOKEN" | sha256sum | awk '{print $1}')
-                elif command -v shasum >/dev/null 2>&1; then
-                    AUTH_TOKEN_HASH=$(printf '%s' "$LOG_INGEST_API_TOKEN" | shasum -a 256 | awk '{print $1}')
-                else
-                    log_error "Neither sha256sum nor shasum is available — cannot hash log_ingest_api_token"
-                    cleanup_on_error
-                    exit 1
-                fi
-
-                if [ -z "$AUTH_TOKEN_HASH" ] || [ "${#AUTH_TOKEN_HASH}" -ne 64 ]; then
-                    log_error "Computed AUTH_TOKEN_HASH is invalid (length=${#AUTH_TOKEN_HASH})"
-                    cleanup_on_error
-                    exit 1
-                fi
-
-                # sed delimiter `|` is safe here: hash is hex, host is a
-                # DNS name, env / token are unlikely to contain `|` but we
-                # still pass each value through a guard pass below.
+                # sed delimiter `|` is safe here: host is a DNS name, URI is
+                # a URL path (starts with `/`), env / token are unlikely to
+                # contain `|`.
                 sed -e "s|{{ENV}}|$ENV_NAME|g" \
-                    -e "s|{{AUTH_TOKEN_HASH}}|$AUTH_TOKEN_HASH|g" \
                     -e "s|{{LOG_INGEST_HOST}}|$LOG_INGEST_HOST|g" \
-                    -e "s|{{LOG_INGEST_TOKEN_PLAIN}}|$LOG_INGEST_API_TOKEN|g" \
+                    -e "s|{{LOG_INGEST_URI}}|$LOG_INGEST_ENDPOINT|g" \
+                    -e "s|{{LOG_INGEST_API_TOKEN}}|$LOG_INGEST_API_TOKEN|g" \
                     "$INGESTOR_CONF_TEMPLATE" > "$INGESTOR_CONF_TARGET"
                 chmod 600 "$INGESTOR_CONF_TARGET"
-                log_info "  Created Log Ingestor configuration: $INGESTOR_CONF_TARGET (endpoint: $LOG_INGEST_ENDPOINT)"
+                log_info "  Created Log Ingestor configuration: $INGESTOR_CONF_TARGET (host: $LOG_INGEST_HOST, uri: $LOG_INGEST_ENDPOINT)"
             else
                 # Empty placeholder so the @INCLUDE in fluent-bit.conf resolves.
                 cat > "$INGESTOR_CONF_TARGET" <<'INGESTOR_CONF_EOF'

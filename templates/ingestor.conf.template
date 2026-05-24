@@ -4,34 +4,35 @@
 # `log_ingest_endpoint` and `log_ingest_api_token`. Otherwise setup.sh writes
 # an empty placeholder so the @INCLUDE in fluent-bit.conf still resolves.
 #
-# Auth contract (Notion #744 + PR #1486):
-#   - Edge fluent-bit MUST inject `_auth_token_hash: sha256:<hex>` into every
-#     record body. Cloud Lua filter looks the hash up in /shared/api-keys.json
-#     and stamps `org_id` / `scope` / `ingestor_key_version` on success.
-#   - `Authorization: Bearer <plaintext>` is sent at the transport layer for
-#     ALB access-log observability only; Cloud Lua does not consult it.
-#   - `org_id` is intentionally NOT set here — Cloud stamps it from the hash
-#     lookup so Edge cannot forge labels.
-#   - `service` / `env` / `job` MUST be present on the record (Cloud Loki
-#     OUTPUT references them as $record['...'] in its Labels line).
+# Auth contract (Notion #744 + PR #1495 / #1496 / #1497):
+#   - The Cloud-side aggregator is fronted by the existing Hub API Gateway,
+#     which performs native API Key authentication (`x-api-key` header).
+#   - The API Key value is `{org_id}_{32-char hex}`; the API Gateway VTL body
+#     mapping template strips the trailing 33 chars and injects the recovered
+#     `org_id` server-side. Client-supplied `org_id` in the record body is
+#     silently dropped (whitelist-style VTL), so forgery is impossible.
+#   - The VTL whitelist preserves only:
+#       log, service, env, job, container_id, container_name, host, stream,
+#       timestamp  (+ server-injected `org_id`)
+#     Edge-only labels like `level` / `run_id` / `supervisor_id` are dropped
+#     by VTL. They remain on the direct-Loki sink above.
 
 [FILTER]
     Name          record_modifier
     Match         agenticsec.*
     Record        env {{ENV}}
     Record        job agenticsec
-    Record        _auth_token_hash sha256:{{AUTH_TOKEN_HASH}}
 
 [OUTPUT]
     Name              http
     Match             agenticsec.*
     Host              {{LOG_INGEST_HOST}}
     Port              443
-    URI               /api/v1/edge-logs
+    URI               {{LOG_INGEST_URI}}
     TLS               On
     TLS.verify        On
     Format            json
-    Header            Authorization Bearer {{LOG_INGEST_TOKEN_PLAIN}}
+    Header            x-api-key {{LOG_INGEST_API_TOKEN}}
     storage.total_limit_size 1G
     Retry_Limit       no_limits
     net.dns.mode        UDP
