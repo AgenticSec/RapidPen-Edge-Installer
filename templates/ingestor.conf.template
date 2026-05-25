@@ -1,0 +1,40 @@
+# Cloud-side Log Ingestor (Fluent Bit aggregator) — dual-output alongside the
+# direct Loki sink above. Rendered by setup.sh from this template only when the
+# Hub /api/edge/installer/v1/observability response provides both
+# `log_ingest_endpoint` and `log_ingest_api_token`. Otherwise setup.sh writes
+# an empty placeholder so the @INCLUDE in fluent-bit.conf still resolves.
+#
+# Auth contract (Notion #744 + PR #1495 / #1496 / #1497):
+#   - The Cloud-side aggregator is fronted by the existing Hub API Gateway,
+#     which performs native API Key authentication (`x-api-key` header).
+#   - The API Key value is `{org_id}_{32-char hex}`; the API Gateway VTL body
+#     mapping template strips the trailing 33 chars and injects the recovered
+#     `org_id` server-side. Client-supplied `org_id` in the record body is
+#     silently dropped (whitelist-style VTL), so forgery is impossible.
+#   - The VTL whitelist preserves only:
+#       log, service, env, job, container_id, container_name, host, stream,
+#       timestamp  (+ server-injected `org_id`)
+#     Edge-only labels like `level` / `run_id` / `supervisor_id` are dropped
+#     by VTL. They remain on the direct-Loki sink above.
+
+[FILTER]
+    Name          record_modifier
+    Match         agenticsec.*
+    Record        env {{ENV}}
+    Record        job agenticsec
+
+[OUTPUT]
+    Name              http
+    Match             agenticsec.*
+    Host              {{LOG_INGEST_HOST}}
+    Port              443
+    URI               {{LOG_INGEST_URI}}
+    TLS               On
+    TLS.verify        On
+    Format            json
+    Header            x-api-key {{LOG_INGEST_API_TOKEN}}
+    storage.total_limit_size 1G
+    Retry_Limit       no_limits
+    net.dns.mode        UDP
+    net.dns.resolver    LEGACY
+    net.dns.prefer_ipv4 true

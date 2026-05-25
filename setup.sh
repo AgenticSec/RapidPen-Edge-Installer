@@ -639,6 +639,66 @@ else
                 exit 1
             fi
 
+            # 9.4b Cloud-side Log Ingestor (Phase 4) — render optional ingestor.conf
+            #
+            # Hub `/api/edge/installer/v1/observability` may return
+            # `log_ingest_endpoint` and `log_ingest_api_token` once Phase 1/2/3
+            # are complete for this org. Both fields are optional and Hub drops
+            # them as a pair, so we only generate the ingestor block when both
+            # are present. Otherwise we write an empty placeholder so the
+            # `@INCLUDE` in fluent-bit.conf still resolves.
+            #
+            # Auth contract (Notion #744 + PR #1495 / #1496 / #1497):
+            # Cloud-side aggregator is fronted by the existing Hub API Gateway,
+            # which performs native API Key authentication. Edge sends the
+            # `{org_id}_{32-hex}` token verbatim in the `x-api-key` header;
+            # API Gateway VTL strips the trailing 33 chars to inject `org_id`
+            # server-side. No client-side hashing required.
+            #
+            # `log_ingest_endpoint` is a URI path (e.g. `/api/v1/edge-logs`).
+            # The host is reused from AGENTICSEC_BASEURL so Edge keeps a
+            # single trust anchor (the Hub API host).
+            LOG_INGEST_ENDPOINT=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_ingest_endpoint // empty') || LOG_INGEST_ENDPOINT=""
+            LOG_INGEST_API_TOKEN=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_ingest_api_token // empty') || LOG_INGEST_API_TOKEN=""
+            INGESTOR_CONF_TEMPLATE="$SCRIPT_DIR/templates/ingestor.conf.template"
+            INGESTOR_CONF_TARGET="$OBSERVABILITY_DIR/ingestor.conf"
+
+            if [ -n "$LOG_INGEST_ENDPOINT" ] && [ "$LOG_INGEST_ENDPOINT" != "null" ] \
+               && [ -n "$LOG_INGEST_API_TOKEN" ] && [ "$LOG_INGEST_API_TOKEN" != "null" ]; then
+                if [ ! -f "$INGESTOR_CONF_TEMPLATE" ]; then
+                    log_error "Template not found: $INGESTOR_CONF_TEMPLATE"
+                    cleanup_on_error
+                    exit 1
+                fi
+
+                LOG_INGEST_HOST=$(echo "$AGENTICSEC_BASEURL" | sed -E 's|https?://([^/]+).*|\1|')
+                if [ -z "$LOG_INGEST_HOST" ]; then
+                    log_error "Could not parse host from AGENTICSEC_BASEURL: $AGENTICSEC_BASEURL"
+                    cleanup_on_error
+                    exit 1
+                fi
+
+                # sed delimiter `|` is safe here: host is a DNS name, URI is
+                # a URL path (starts with `/`), env / token are unlikely to
+                # contain `|`.
+                sed -e "s|{{ENV}}|$ENV_NAME|g" \
+                    -e "s|{{LOG_INGEST_HOST}}|$LOG_INGEST_HOST|g" \
+                    -e "s|{{LOG_INGEST_URI}}|$LOG_INGEST_ENDPOINT|g" \
+                    -e "s|{{LOG_INGEST_API_TOKEN}}|$LOG_INGEST_API_TOKEN|g" \
+                    "$INGESTOR_CONF_TEMPLATE" > "$INGESTOR_CONF_TARGET"
+                chmod 600 "$INGESTOR_CONF_TARGET"
+                log_info "  Created Log Ingestor configuration: $INGESTOR_CONF_TARGET (host: $LOG_INGEST_HOST, uri: $LOG_INGEST_ENDPOINT)"
+            else
+                # Empty placeholder so the @INCLUDE in fluent-bit.conf resolves.
+                cat > "$INGESTOR_CONF_TARGET" <<'INGESTOR_CONF_EOF'
+# Log Ingestor not configured for this organization yet — Hub returned no
+# log_ingest_endpoint / log_ingest_api_token. Re-run the installer after
+# Phase 4 rollout for this org to enable the dual-output sink.
+INGESTOR_CONF_EOF
+                chmod 644 "$INGESTOR_CONF_TARGET"
+                log_info "  Log Ingestor not configured (Hub returned no log_ingest_endpoint); wrote empty placeholder"
+            fi
+
             # 9.5 Fluent Bit systemd サービスインストール
             FLUENT_BIT_SERVICE_TEMPLATE="$SCRIPT_DIR/templates/agenticsec-fluent-bit.service.template"
             if [ -f "$FLUENT_BIT_SERVICE_TEMPLATE" ]; then

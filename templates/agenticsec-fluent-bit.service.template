@@ -12,6 +12,7 @@ ExecStart={{DOCKER_BIN}} run --rm \
     --name agenticsec-fluent-bit \
     -v /var/log/agenticsec:/var/log/agenticsec:ro \
     -v /etc/agenticsec/edge-observability/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro \
+    -v /etc/agenticsec/edge-observability/ingestor.conf:/fluent-bit/etc/ingestor.conf:ro \
     -v agenticsec-fluent-bit-data:/fluent-bit/data \
     fluent/fluent-bit:latest \
     -c /fluent-bit/etc/fluent-bit.conf
