@@ -681,8 +681,7 @@ else
                 # sed delimiter `|` is safe here: host is a DNS name, URI is
                 # a URL path (starts with `/`), env / token are unlikely to
                 # contain `|`.
-                sed -e "s|{{ENV}}|$ENV_NAME|g" \
-                    -e "s|{{LOG_INGEST_HOST}}|$LOG_INGEST_HOST|g" \
+                    sed -e "s|{{LOG_INGEST_HOST}}|$LOG_INGEST_HOST|g" \
                     -e "s|{{LOG_INGEST_URI}}|$LOG_INGEST_ENDPOINT|g" \
                     -e "s|{{LOG_INGEST_API_TOKEN}}|$LOG_INGEST_API_TOKEN|g" \
                     "$INGESTOR_CONF_TEMPLATE" > "$INGESTOR_CONF_TARGET"
