@@ -3,6 +3,7 @@
     Daemon       Off
     Log_Level    info
     Parsers_File /fluent-bit/etc/parsers.conf
+    Hot_Reload   On
     storage.path /fluent-bit/data/storage
     storage.sync normal
     storage.backlog.mem_limit 64M
