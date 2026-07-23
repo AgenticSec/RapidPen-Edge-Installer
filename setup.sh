@@ -576,184 +576,136 @@ if [ -z "$OBSERVABILITY_RESPONSE" ]; then
 else
     # レスポンスが有効なJSONか確認
     if echo "$OBSERVABILITY_RESPONSE" | jq_exec -e . > /dev/null 2>&1; then
-        # 必須フィールド確認
-        LOKI_ENDPOINT=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_endpoint // empty') || {
-            log_error "Failed to parse log_endpoint from observability response"
-            cleanup_on_error
-            exit 1
-        }
+        # 9.3 レスポンスJSONをそのまま保存
+        #     直接 Loki 送信（log_endpoint / log_user_id / log_api_token）は
+        #     廃止したため必須チェックしない。Cloud Log Ingestor 用の
+        #     log_ingest_endpoint / log_ingest_api_token を含むので保持する。
+        echo "$OBSERVABILITY_RESPONSE" > "$OBSERVABILITY_DIR/api-config.json"
+        chmod 600 "$OBSERVABILITY_DIR/api-config.json"
+        log_info "  Saved observability configuration to $OBSERVABILITY_DIR/api-config.json"
 
-        if [ -z "$LOKI_ENDPOINT" ]; then
-            log_error "Invalid observability configuration received (missing log_endpoint)"
-            log_error "  Please check the Hub API configuration."
-            cleanup_on_error
-            exit 1
+        # 9.4 Fluent Bit設定ファイル生成
+        #     直接 Loki OUTPUT を廃止したため、テンプレートには置換対象の
+        #     プレースホルダが残っていない。そのままコピーするだけでよい。
+        FLUENT_BIT_CONFIG_TEMPLATE="$SCRIPT_DIR/templates/fluent-bit.conf.template"
+        if [ -f "$FLUENT_BIT_CONFIG_TEMPLATE" ]; then
+            cp "$FLUENT_BIT_CONFIG_TEMPLATE" "$OBSERVABILITY_DIR/fluent-bit.conf"
+            chmod 644 "$OBSERVABILITY_DIR/fluent-bit.conf"
+            log_info "  Created Fluent Bit configuration: $OBSERVABILITY_DIR/fluent-bit.conf"
         else
-            # 9.3 レスポンスJSONをそのまま保存
-            echo "$OBSERVABILITY_RESPONSE" > "$OBSERVABILITY_DIR/api-config.json"
-            chmod 600 "$OBSERVABILITY_DIR/api-config.json"
-            log_info "  Saved observability configuration to $OBSERVABILITY_DIR/api-config.json"
+            log_error "Template not found: $FLUENT_BIT_CONFIG_TEMPLATE"
+            cleanup_on_error
+            exit 1
+        fi
 
-            # 9.4 Fluent Bit設定ファイル生成
-            LOKI_HOST=$(echo "$LOKI_ENDPOINT" | sed -E 's|https?://([^/]+).*|\1|')
-            LOKI_USER_ID=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_user_id') || {
-                log_error "Failed to parse log_user_id from observability response"
-                cleanup_on_error
-                exit 1
-            }
-            LOKI_API_TOKEN=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_api_token') || {
-                log_error "Failed to parse log_api_token from observability response"
-                cleanup_on_error
-                exit 1
-            }
-            ENV_NAME=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.env') || {
-                log_error "Failed to parse env from observability response"
-                cleanup_on_error
-                exit 1
-            }
+        # 9.4b Cloud-side Log Ingestor — render optional ingestor.conf
+        #
+        # The observability API may return `log_ingest_endpoint` and
+        # `log_ingest_api_token`. Both fields are optional and dropped as a
+        # pair, so we only generate the ingestor block when both are present.
+        # Otherwise we write an empty placeholder so the `@INCLUDE` in
+        # fluent-bit.conf still resolves.
+        #
+        # Auth: the endpoint is fronted by an API Gateway that performs native
+        # API Key authentication. Edge sends the token verbatim in the
+        # `x-api-key` header; no client-side hashing is required.
+        #
+        # `log_ingest_endpoint` may arrive as a full URL. Fluent Bit's http
+        # output `URI` must be a PATH only (Host/Port are set separately); a
+        # full URL there yields a malformed request-target that the API host
+        # answers with a 301, so the request silently fails. We reduce it to
+        # its path component below. The host is taken from AGENTICSEC_BASEURL
+        # so Edge keeps a single trust anchor.
+        LOG_INGEST_ENDPOINT=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_ingest_endpoint // empty') || LOG_INGEST_ENDPOINT=""
+        LOG_INGEST_API_TOKEN=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_ingest_api_token // empty') || LOG_INGEST_API_TOKEN=""
+        INGESTOR_CONF_TEMPLATE="$SCRIPT_DIR/templates/ingestor.conf.template"
+        INGESTOR_CONF_TARGET="$OBSERVABILITY_DIR/ingestor.conf"
 
-            if [ -z "$LOKI_HOST" ] || [ -z "$LOKI_USER_ID" ] || [ "$LOKI_USER_ID" = "null" ] || [ -z "$LOKI_API_TOKEN" ] || [ "$LOKI_API_TOKEN" = "null" ] || [ -z "$ENV_NAME" ] || [ "$ENV_NAME" = "null" ]; then
-                log_error "Incomplete observability configuration received from Hub"
-                log_error "  log_endpoint host: ${LOKI_HOST:-<empty>}"
-                log_error "  log_user_id: ${LOKI_USER_ID:-<empty>}"
-                log_error "  log_api_token: $(if [ -n "$LOKI_API_TOKEN" ] && [ "$LOKI_API_TOKEN" != "null" ]; then echo '<set>'; else echo '<empty>'; fi)"
-                log_error "  env: ${ENV_NAME:-<empty>}"
-                log_error "  Please check the Hub observability configuration."
-                cleanup_on_error
-                exit 1
-            fi
-
-            FLUENT_BIT_CONFIG_TEMPLATE="$SCRIPT_DIR/templates/fluent-bit.conf.template"
-            if [ -f "$FLUENT_BIT_CONFIG_TEMPLATE" ]; then
-                sed -e "s|{{LOKI_ENDPOINT_HOST}}|$LOKI_HOST|g" \
-                    -e "s|{{LOKI_USER_ID}}|$LOKI_USER_ID|g" \
-                    -e "s|{{LOKI_API_TOKEN}}|$LOKI_API_TOKEN|g" \
-                    -e "s|{{SUPERVISOR_ID}}|$SUPERVISOR_ID_CANDIDATE|g" \
-                    -e "s|{{ENV}}|$ENV_NAME|g" \
-                    "$FLUENT_BIT_CONFIG_TEMPLATE" > "$OBSERVABILITY_DIR/fluent-bit.conf"
-                chmod 644 "$OBSERVABILITY_DIR/fluent-bit.conf"
-                log_info "  Created Fluent Bit configuration: $OBSERVABILITY_DIR/fluent-bit.conf"
-            else
-                log_error "Template not found: $FLUENT_BIT_CONFIG_TEMPLATE"
+        if [ -n "$LOG_INGEST_ENDPOINT" ] && [ "$LOG_INGEST_ENDPOINT" != "null" ] \
+           && [ -n "$LOG_INGEST_API_TOKEN" ] && [ "$LOG_INGEST_API_TOKEN" != "null" ]; then
+            if [ ! -f "$INGESTOR_CONF_TEMPLATE" ]; then
+                log_error "Template not found: $INGESTOR_CONF_TEMPLATE"
                 cleanup_on_error
                 exit 1
             fi
 
-            # 9.4b Cloud-side Log Ingestor (Phase 4) — render optional ingestor.conf
-            #
-            # Hub `/api/edge/installer/v1/observability` may return
-            # `log_ingest_endpoint` and `log_ingest_api_token` once Phase 1/2/3
-            # are complete for this org. Both fields are optional and Hub drops
-            # them as a pair, so we only generate the ingestor block when both
-            # are present. Otherwise we write an empty placeholder so the
-            # `@INCLUDE` in fluent-bit.conf still resolves.
-            #
-            # Auth contract (Notion #744 + PR #1495 / #1496 / #1497):
-            # Cloud-side aggregator is fronted by the existing Hub API Gateway,
-            # which performs native API Key authentication. Edge sends the
-            # `{org_id}_{32-hex}` token verbatim in the `x-api-key` header;
-            # API Gateway VTL strips the trailing 33 chars to inject `org_id`
-            # server-side. No client-side hashing required.
-            #
-            # The Hub returns `log_ingest_endpoint` as a full URL (e.g.
-            # `https://api-stg.agenticsec.tech/api/v1/edge-logs`). Fluent Bit's
-            # http output `URI` must be a PATH only (Host/Port are set
-            # separately); a full URL there yields a malformed request-target
-            # that the API host answers with a 301, so the dual-write silently
-            # fails. We reduce it to its path component below. The host is taken
-            # from AGENTICSEC_BASEURL so Edge keeps a single trust anchor (the
-            # Hub API host).
-            LOG_INGEST_ENDPOINT=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_ingest_endpoint // empty') || LOG_INGEST_ENDPOINT=""
-            LOG_INGEST_API_TOKEN=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_ingest_api_token // empty') || LOG_INGEST_API_TOKEN=""
-            INGESTOR_CONF_TEMPLATE="$SCRIPT_DIR/templates/ingestor.conf.template"
-            INGESTOR_CONF_TARGET="$OBSERVABILITY_DIR/ingestor.conf"
+            LOG_INGEST_HOST=$(echo "$AGENTICSEC_BASEURL" | sed -E 's|https?://([^/]+).*|\1|')
+            if [ -z "$LOG_INGEST_HOST" ]; then
+                log_error "Could not parse host from AGENTICSEC_BASEURL: $AGENTICSEC_BASEURL"
+                cleanup_on_error
+                exit 1
+            fi
 
-            if [ -n "$LOG_INGEST_ENDPOINT" ] && [ "$LOG_INGEST_ENDPOINT" != "null" ] \
-               && [ -n "$LOG_INGEST_API_TOKEN" ] && [ "$LOG_INGEST_API_TOKEN" != "null" ]; then
-                if [ ! -f "$INGESTOR_CONF_TEMPLATE" ]; then
-                    log_error "Template not found: $INGESTOR_CONF_TEMPLATE"
-                    cleanup_on_error
-                    exit 1
-                fi
+            # Reduce log_ingest_endpoint to a path for Fluent Bit's `URI`.
+            # A full URL here makes Fluent Bit emit a malformed request-target
+            # that the API host 301s, so the request never lands. Strip
+            # scheme+host when present and guarantee a leading slash (a bare
+            # path passes through).
+            case "$LOG_INGEST_ENDPOINT" in
+                http://*|https://*)
+                    LOG_INGEST_URI=$(echo "$LOG_INGEST_ENDPOINT" | sed -E 's|^https?://[^/]+||') ;;
+                *)
+                    LOG_INGEST_URI="$LOG_INGEST_ENDPOINT" ;;
+            esac
+            case "$LOG_INGEST_URI" in
+                /*) ;;
+                *) LOG_INGEST_URI="/$LOG_INGEST_URI" ;;
+            esac
 
-                LOG_INGEST_HOST=$(echo "$AGENTICSEC_BASEURL" | sed -E 's|https?://([^/]+).*|\1|')
-                if [ -z "$LOG_INGEST_HOST" ]; then
-                    log_error "Could not parse host from AGENTICSEC_BASEURL: $AGENTICSEC_BASEURL"
-                    cleanup_on_error
-                    exit 1
-                fi
-
-                # Reduce log_ingest_endpoint to a path for Fluent Bit's `URI`.
-                # The Hub returns a full URL; passing it verbatim makes Fluent
-                # Bit emit a malformed request-target that the API host 301s, so
-                # the dual-write never lands. Strip scheme+host when present and
-                # guarantee a leading slash (a bare path passes through).
-                case "$LOG_INGEST_ENDPOINT" in
-                    http://*|https://*)
-                        LOG_INGEST_URI=$(echo "$LOG_INGEST_ENDPOINT" | sed -E 's|^https?://[^/]+||') ;;
-                    *)
-                        LOG_INGEST_URI="$LOG_INGEST_ENDPOINT" ;;
-                esac
-                case "$LOG_INGEST_URI" in
-                    /*) ;;
-                    *) LOG_INGEST_URI="/$LOG_INGEST_URI" ;;
-                esac
-
-                # sed delimiter `|` is safe here: host is a DNS name, URI is
-                # a URL path (starts with `/`), env / token are unlikely to
-                # contain `|`.
-                sed -e "s|{{LOG_INGEST_HOST}}|$LOG_INGEST_HOST|g" \
-                    -e "s|{{LOG_INGEST_URI}}|$LOG_INGEST_URI|g" \
-                    -e "s|{{LOG_INGEST_API_TOKEN}}|$LOG_INGEST_API_TOKEN|g" \
-                    "$INGESTOR_CONF_TEMPLATE" > "$INGESTOR_CONF_TARGET"
-                chmod 600 "$INGESTOR_CONF_TARGET"
-                log_info "  Created Log Ingestor configuration: $INGESTOR_CONF_TARGET (host: $LOG_INGEST_HOST, uri: $LOG_INGEST_URI)"
-            else
-                # Empty placeholder so the @INCLUDE in fluent-bit.conf resolves.
-                cat > "$INGESTOR_CONF_TARGET" <<'INGESTOR_CONF_EOF'
-# Log Ingestor not configured for this organization yet — Hub returned no
-# log_ingest_endpoint / log_ingest_api_token. Re-run the installer after
-# Phase 4 rollout for this org to enable the dual-output sink.
+            # sed delimiter `|` is safe here: host is a DNS name, URI is
+            # a URL path (starts with `/`), env / token are unlikely to
+            # contain `|`.
+            sed -e "s|{{LOG_INGEST_HOST}}|$LOG_INGEST_HOST|g" \
+                -e "s|{{LOG_INGEST_URI}}|$LOG_INGEST_URI|g" \
+                -e "s|{{LOG_INGEST_API_TOKEN}}|$LOG_INGEST_API_TOKEN|g" \
+                "$INGESTOR_CONF_TEMPLATE" > "$INGESTOR_CONF_TARGET"
+            chmod 600 "$INGESTOR_CONF_TARGET"
+            log_info "  Created Log Ingestor configuration: $INGESTOR_CONF_TARGET (host: $LOG_INGEST_HOST, uri: $LOG_INGEST_URI)"
+        else
+            # Empty placeholder so the @INCLUDE in fluent-bit.conf resolves.
+            cat > "$INGESTOR_CONF_TARGET" <<'INGESTOR_CONF_EOF'
+# Log Ingestor not configured — no log_ingest_endpoint / log_ingest_api_token
+# was returned for this organization. Re-run the installer once it becomes
+# available to enable this sink.
 INGESTOR_CONF_EOF
-                chmod 644 "$INGESTOR_CONF_TARGET"
-                log_info "  Log Ingestor not configured (Hub returned no log_ingest_endpoint); wrote empty placeholder"
+            chmod 644 "$INGESTOR_CONF_TARGET"
+            log_info "  Log Ingestor not configured (Hub returned no log_ingest_endpoint); wrote empty placeholder"
+        fi
+
+        # 9.5 Fluent Bit systemd サービスインストール
+        FLUENT_BIT_SERVICE_TEMPLATE="$SCRIPT_DIR/templates/agenticsec-fluent-bit.service.template"
+        if [ -f "$FLUENT_BIT_SERVICE_TEMPLATE" ]; then
+            sed -e "s|{{DOCKER_BIN}}|$DOCKER_BIN|g" \
+                "$FLUENT_BIT_SERVICE_TEMPLATE" > /etc/systemd/system/agenticsec-fluent-bit.service
+            log_info "  Created service file at /etc/systemd/system/agenticsec-fluent-bit.service"
+
+            # systemdをリロード
+            systemctl daemon-reload
+            log_info "  Reloaded systemd daemon"
+
+            # サービスを有効化（自動起動）
+            systemctl enable agenticsec-fluent-bit
+            log_info "  Enabled agenticsec-fluent-bit service (auto-start on boot)"
+
+            # Fluent Bitイメージをpull
+            log_info "Pulling Fluent Bit image..."
+            FB_PULL_OUTPUT=$(docker pull fluent/fluent-bit:latest 2>&1) || {
+                log_warn "Failed to pull Fluent Bit image"
+                log_warn "  Docker error: $(echo "$FB_PULL_OUTPUT" | tail -2)"
+                log_warn "  Service will attempt to pull on first start"
+            }
+            if docker image inspect fluent/fluent-bit:latest > /dev/null 2>&1; then
+                log_info "  ✓ Fluent Bit image ready"
             fi
 
-            # 9.5 Fluent Bit systemd サービスインストール
-            FLUENT_BIT_SERVICE_TEMPLATE="$SCRIPT_DIR/templates/agenticsec-fluent-bit.service.template"
-            if [ -f "$FLUENT_BIT_SERVICE_TEMPLATE" ]; then
-                sed -e "s|{{DOCKER_BIN}}|$DOCKER_BIN|g" \
-                    "$FLUENT_BIT_SERVICE_TEMPLATE" > /etc/systemd/system/agenticsec-fluent-bit.service
-                log_info "  Created service file at /etc/systemd/system/agenticsec-fluent-bit.service"
-
-                # systemdをリロード
-                systemctl daemon-reload
-                log_info "  Reloaded systemd daemon"
-
-                # サービスを有効化（自動起動）
-                systemctl enable agenticsec-fluent-bit
-                log_info "  Enabled agenticsec-fluent-bit service (auto-start on boot)"
-
-                # Fluent Bitイメージをpull
-                log_info "Pulling Fluent Bit image..."
-                FB_PULL_OUTPUT=$(docker pull fluent/fluent-bit:latest 2>&1) || {
-                    log_warn "Failed to pull Fluent Bit image"
-                    log_warn "  Docker error: $(echo "$FB_PULL_OUTPUT" | tail -2)"
-                    log_warn "  Service will attempt to pull on first start"
-                }
-                if docker image inspect fluent/fluent-bit:latest > /dev/null 2>&1; then
-                    log_info "  ✓ Fluent Bit image ready"
-                fi
-
-                # サービスを起動
-                systemctl start agenticsec-fluent-bit
-                log_info "  Started agenticsec-fluent-bit service"
-                log_info "  ✓ Observability setup completed"
-            else
-                log_error "Template not found: $FLUENT_BIT_SERVICE_TEMPLATE"
-                cleanup_on_error
-                exit 1
-            fi
+            # サービスを起動
+            systemctl start agenticsec-fluent-bit
+            log_info "  Started agenticsec-fluent-bit service"
+            log_info "  ✓ Observability setup completed"
+        else
+            log_error "Template not found: $FLUENT_BIT_SERVICE_TEMPLATE"
+            cleanup_on_error
+            exit 1
         fi
     else
         log_error "Received invalid JSON response from Hub API"
