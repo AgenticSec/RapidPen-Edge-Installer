@@ -655,9 +655,14 @@ else
             # API Gateway VTL strips the trailing 33 chars to inject `org_id`
             # server-side. No client-side hashing required.
             #
-            # `log_ingest_endpoint` is a URI path (e.g. `/api/v1/edge-logs`).
-            # The host is reused from AGENTICSEC_BASEURL so Edge keeps a
-            # single trust anchor (the Hub API host).
+            # The Hub returns `log_ingest_endpoint` as a full URL (e.g.
+            # `https://api-stg.agenticsec.tech/api/v1/edge-logs`). Fluent Bit's
+            # http output `URI` must be a PATH only (Host/Port are set
+            # separately); a full URL there yields a malformed request-target
+            # that the API host answers with a 301, so the dual-write silently
+            # fails. We reduce it to its path component below. The host is taken
+            # from AGENTICSEC_BASEURL so Edge keeps a single trust anchor (the
+            # Hub API host).
             LOG_INGEST_ENDPOINT=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_ingest_endpoint // empty') || LOG_INGEST_ENDPOINT=""
             LOG_INGEST_API_TOKEN=$(echo "$OBSERVABILITY_RESPONSE" | jq_exec -r '.log_ingest_api_token // empty') || LOG_INGEST_API_TOKEN=""
             INGESTOR_CONF_TEMPLATE="$SCRIPT_DIR/templates/ingestor.conf.template"
@@ -678,15 +683,31 @@ else
                     exit 1
                 fi
 
+                # Reduce log_ingest_endpoint to a path for Fluent Bit's `URI`.
+                # The Hub returns a full URL; passing it verbatim makes Fluent
+                # Bit emit a malformed request-target that the API host 301s, so
+                # the dual-write never lands. Strip scheme+host when present and
+                # guarantee a leading slash (a bare path passes through).
+                case "$LOG_INGEST_ENDPOINT" in
+                    http://*|https://*)
+                        LOG_INGEST_URI=$(echo "$LOG_INGEST_ENDPOINT" | sed -E 's|^https?://[^/]+||') ;;
+                    *)
+                        LOG_INGEST_URI="$LOG_INGEST_ENDPOINT" ;;
+                esac
+                case "$LOG_INGEST_URI" in
+                    /*) ;;
+                    *) LOG_INGEST_URI="/$LOG_INGEST_URI" ;;
+                esac
+
                 # sed delimiter `|` is safe here: host is a DNS name, URI is
                 # a URL path (starts with `/`), env / token are unlikely to
                 # contain `|`.
-                    sed -e "s|{{LOG_INGEST_HOST}}|$LOG_INGEST_HOST|g" \
-                    -e "s|{{LOG_INGEST_URI}}|$LOG_INGEST_ENDPOINT|g" \
+                sed -e "s|{{LOG_INGEST_HOST}}|$LOG_INGEST_HOST|g" \
+                    -e "s|{{LOG_INGEST_URI}}|$LOG_INGEST_URI|g" \
                     -e "s|{{LOG_INGEST_API_TOKEN}}|$LOG_INGEST_API_TOKEN|g" \
                     "$INGESTOR_CONF_TEMPLATE" > "$INGESTOR_CONF_TARGET"
                 chmod 600 "$INGESTOR_CONF_TARGET"
-                log_info "  Created Log Ingestor configuration: $INGESTOR_CONF_TARGET (host: $LOG_INGEST_HOST, uri: $LOG_INGEST_ENDPOINT)"
+                log_info "  Created Log Ingestor configuration: $INGESTOR_CONF_TARGET (host: $LOG_INGEST_HOST, uri: $LOG_INGEST_URI)"
             else
                 # Empty placeholder so the @INCLUDE in fluent-bit.conf resolves.
                 cat > "$INGESTOR_CONF_TARGET" <<'INGESTOR_CONF_EOF'
