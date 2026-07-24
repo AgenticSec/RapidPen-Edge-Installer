@@ -1,24 +1,19 @@
-# Cloud-side Log Ingestor (Fluent Bit aggregator) — dual-output alongside the
-# direct Loki sink in fluent-bit.conf. Rendered by setup.sh from this template
+# Cloud-side Log Ingestor (Fluent Bit aggregator) — the only cloud log-shipping
+# path on the edge now that the direct Loki sink has been removed from
+# fluent-bit.conf. Rendered by setup.sh from this template
 # only when the Hub /api/edge/installer/v1/observability response provides both
 # `log_ingest_endpoint` and `log_ingest_api_token`. Otherwise setup.sh writes
 # an empty placeholder so the @INCLUDE in fluent-bit.conf still resolves.
 #
-# Wire / auth contract — dual-output log record contract, option C
-# (AgenticSec docs/developer/system-design/technical-specs/log-ingestor.md):
+# Wire / auth contract:
 #   - Edge ships the structured records verbatim as a JSON array (`Format
-#     json`) to the Hub API Gateway, which performs native API Key auth on the
-#     `x-api-key` header. The key is `{org_id}_{32-char hex}`; API Gateway VTL
-#     strips the trailing 33 chars to recover `org_id` server-side and wraps the
-#     body as `{"org_id": <recovered>, "records": <body>}` WITHOUT rebuilding it
-#     (no field whitelist).
-#   - The Cloud aggregator explodes that wrapper, stamps the authoritative
-#     `org_id` and `env` onto every record, and dual-writes to Loki + CloudWatch.
-#   - Because the body passes through unmodified, every field — `level` /
-#     `run_id` / `supervisor_id` / `trace_id` / the free-form `app.details` —
-#     reaches the aggregator intact. Edge does NOT pre-shape records and does
-#     NOT inject `env`/`job`: the aggregator owns `env`, and `org_id` is
-#     server-derived, so forgery is impossible.
+#     json`) to an API Gateway that performs native API Key auth on the
+#     `x-api-key` header. The org identity is derived server-side from the
+#     key, and the body passes through unmodified.
+#   - Because the body is not reshaped, every field — `level` / `run_id` /
+#     `supervisor_id` / `trace_id` / the free-form `app.details` — reaches the
+#     backend intact. Edge does NOT pre-shape records and does NOT inject
+#     `env`/`job`; those are owned server-side, so forgery is not possible.
 
 [OUTPUT]
     Name              http
