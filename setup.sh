@@ -64,20 +64,6 @@ run_with_timeout() {
     fi
 }
 
-# 到達性の確認。ghcr.io/v2/ のように 401 を返すエンドポイントも
-# 「到達できている」と扱いたいので、-f ではなく HTTP ステータスで判定する。
-check_endpoint() {
-    _ep_name="$1"
-    _ep_url="$2"
-    _ep_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$_ep_url" 2>/dev/null) || _ep_code="000"
-    if [ "$_ep_code" = "000" ]; then
-        log_error "  ✗ $_ep_name ($_ep_url)"
-        return 1
-    fi
-    log_info "  ✓ $_ep_name (HTTP $_ep_code)"
-    return 0
-}
-
 # 制御端末を実際に open できるか（存在確認では不十分）
 tty_available() {
     : < /dev/tty 2>/dev/null
@@ -95,6 +81,10 @@ ensure_tty_input_sane() {
     tty_available || return 0
     command -v stty > /dev/null 2>&1 || return 0
     SAVED_STTY=$(stty -g < /dev/tty 2>/dev/null) || SAVED_STTY=""
+    # 途中でエラー終了したり Ctrl-C で中断されたりしても、端末設定を残さない
+    trap 'restore_tty' EXIT
+    trap 'restore_tty; exit 130' INT
+    trap 'restore_tty; exit 143' TERM
     if ! tty_icrnl_enabled; then
         log_warn "  Terminal has icrnl disabled; enabling it so that Enter is accepted"
         log_warn "  (端末の改行変換が無効なため、入力を受け付けるよう一時的に有効化します)"
@@ -140,14 +130,16 @@ input_failure_help() {
 # NOTE: 呼び出し側はコマンド置換で受けるため、プロンプトは標準出力ではなく
 #       /dev/tty へ直接書く。標準出力に書くと、プロンプト文字列まで
 #       戻り値として取り込まれてしまい、画面にも表示されない。
+# NOTE: IFS は既定のままにしておく。`IFS= read` にすると入力の前後の空白が
+#       そのまま残り、貼り付け時に混入した空白付きの API キーを保存してしまう。
 prompt_read() {
     printf "%s" "$1" > /dev/tty
     if [ -n "$TIMEOUT_FG" ]; then
         # shellcheck disable=SC2086
-        $TIMEOUT_FG "$INPUT_TIMEOUT_SEC" sh -c 'IFS= read -r _v < /dev/tty && printf "%s" "$_v"'
+        $TIMEOUT_FG "$INPUT_TIMEOUT_SEC" sh -c 'read -r _v < /dev/tty && printf "%s" "$_v"'
     else
         # timeout --foreground が使えない環境では従来どおり待つ
-        IFS= read -r _v < /dev/tty && printf "%s" "$_v"
+        read -r _v < /dev/tty && printf "%s" "$_v"
     fi
 }
 
@@ -350,28 +342,6 @@ if ! "$DOCKER_BIN" info > /dev/null 2>&1; then
     exit 1
 fi
 log_info "✓ Docker daemon is running"
-
-# 2.5 通信先の到達性チェック
-#
-# インストールには api.agenticsec.tech 以外にも GitHub / GHCR / Docker Hub への
-# HTTPS 通信が必要。ここで落ちていないと、後段の docker pull が長時間ハングし、
-# 利用者からは原因が全く見えない形で止まる。
-log_info "Checking network reachability..."
-UNREACHABLE=0
-check_endpoint "GitHub (installer & release)" "https://github.com"           || UNREACHABLE=1
-check_endpoint "GHCR (supervisor image)"      "https://ghcr.io/v2/"          || UNREACHABLE=1
-check_endpoint "Docker Hub (fluent-bit)"      "https://registry-1.docker.io/v2/" || UNREACHABLE=1
-
-if [ "$UNREACHABLE" -ne 0 ]; then
-    log_error "Cannot reach the endpoints required for installation"
-    log_error "  (インストールに必要な通信先に到達できません)"
-    log_error ""
-    log_error "Allow HTTPS outbound access to the hosts marked with x above."
-    log_error "In a proxy environment, the Docker daemon needs its own proxy settings:"
-    log_error "  sudo systemctl show docker --property=Environment"
-    exit 1
-fi
-log_info "✓ Required endpoints are reachable"
 
 # Pre-install: Clean up legacy rapidpen-* resources
 log_info "Checking for legacy rapidpen-* resources..."
