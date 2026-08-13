@@ -20,6 +20,137 @@ log_warn() {
     printf "${YELLOW}[WARN]${NC} %s\n" "$1"
 }
 
+# --- 対話入力まわり ---------------------------------------------------------
+#
+# インストーラは API キーを端末から読む。ここは以下の理由で壊れやすいので、
+# 「無言で待ち続けない」ことを最優先に組み立てている。
+#
+#   - /dev/tty はデバイスファイルとして常に存在するため、その存在確認だけでは
+#     制御端末の有無を判定できない（実際に open して確かめる必要がある）
+#   - 端末の icrnl（CR->NL 変換）が落ちていると Enter キーが改行として read に
+#     届かない。打鍵した文字は端末のエコーで画面に見えるため、利用者からは
+#     「入力したのに何も起きない」ようにしか見えず、原因にたどり着けない
+#
+INSTALL_URL="https://raw.githubusercontent.com/AgenticSec/AgenticSec-Edge-Installer/main/install.sh"
+DEFAULT_BASEURL="https://api.agenticsec.tech/api/edge/supervisor"
+INPUT_TIMEOUT_SEC="${AGENTICSEC_INPUT_TIMEOUT_SEC:-120}"
+PULL_TIMEOUT_SEC="${AGENTICSEC_PULL_TIMEOUT_SEC:-900}"
+SAVED_STTY=""
+
+# timeout(1) の利用可否。
+#   TIMEOUT_BIN: 一般用途（イメージ取得など）
+#   TIMEOUT_FG : 端末入力を待つ用途。--foreground が無いと timeout 配下の
+#                コマンドは別プロセスグループで動き、端末からの read が
+#                SIGTTIN で停止してしまう。使える場合のみ設定する。
+TIMEOUT_BIN=""
+TIMEOUT_FG=""
+if command -v timeout > /dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
+    if timeout --foreground 1 true > /dev/null 2>&1; then
+        TIMEOUT_FG="timeout --foreground"
+    fi
+fi
+
+# timeout(1) があれば使い、無ければそのまま実行する。
+# タイムアウトした場合は timeout(1) の終了コード 124 が返る。
+run_with_timeout() {
+    _rwt_sec="$1"
+    shift
+    if [ -n "$TIMEOUT_BIN" ]; then
+        # shellcheck disable=SC2086
+        $TIMEOUT_BIN "$_rwt_sec" "$@"
+    else
+        "$@"
+    fi
+}
+
+# 到達性の確認。ghcr.io/v2/ のように 401 を返すエンドポイントも
+# 「到達できている」と扱いたいので、-f ではなく HTTP ステータスで判定する。
+check_endpoint() {
+    _ep_name="$1"
+    _ep_url="$2"
+    _ep_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$_ep_url" 2>/dev/null) || _ep_code="000"
+    if [ "$_ep_code" = "000" ]; then
+        log_error "  ✗ $_ep_name ($_ep_url)"
+        return 1
+    fi
+    log_info "  ✓ $_ep_name (HTTP $_ep_code)"
+    return 0
+}
+
+# 制御端末を実際に open できるか（存在確認では不十分）
+tty_available() {
+    : < /dev/tty 2>/dev/null
+}
+
+# icrnl が有効か
+tty_icrnl_enabled() {
+    command -v stty > /dev/null 2>&1 || return 1
+    tty_available || return 1
+    stty -a < /dev/tty 2>/dev/null | tr ' ;' '\n\n' | grep -qx 'icrnl'
+}
+
+# 対話入力の間だけ端末を入力可能な状態にする（終了時に restore_tty で戻す）
+ensure_tty_input_sane() {
+    tty_available || return 0
+    command -v stty > /dev/null 2>&1 || return 0
+    SAVED_STTY=$(stty -g < /dev/tty 2>/dev/null) || SAVED_STTY=""
+    if ! tty_icrnl_enabled; then
+        log_warn "  Terminal has icrnl disabled; enabling it so that Enter is accepted"
+        log_warn "  (端末の改行変換が無効なため、入力を受け付けるよう一時的に有効化します)"
+    fi
+    stty icrnl < /dev/tty 2>/dev/null || true
+}
+
+restore_tty() {
+    [ -n "$SAVED_STTY" ] || return 0
+    stty "$SAVED_STTY" < /dev/tty 2>/dev/null || true
+    SAVED_STTY=""
+}
+
+# 入力を受け取れなかったときの診断情報
+tty_diagnostics() {
+    # tty(1) は標準入力を見るため、必ず制御端末を渡して判定する
+    _diag_tty=$(tty < /dev/tty 2>/dev/null) || _diag_tty="(none)"
+    if [ -t 0 ]; then _diag_stdin="terminal"; else _diag_stdin="pipe/redirect"; fi
+    if tty_icrnl_enabled; then _diag_icrnl="enabled"; else _diag_icrnl="DISABLED"; fi
+    log_error "    tty=$_diag_tty  stdin=$_diag_stdin  icrnl=$_diag_icrnl"
+}
+
+# 入力を受け取れなかったときの復旧手順
+input_failure_help() {
+    log_error ""
+    log_error "The installer could not read your input from the terminal."
+    log_error "(端末からの入力を受け取れませんでした)"
+    tty_diagnostics
+    log_error ""
+    log_error "Try either of the following / 次のいずれかをお試しください:"
+    log_error "  1) Reset the terminal, then run the installer again:"
+    log_error "       stty sane"
+    log_error "  2) Install without interactive input:"
+    log_error "       curl -fsSL $INSTALL_URL -o agenticsec-install.sh"
+    log_error "       sudo AGENTICSEC_API_KEY='<your-api-key>' \\"
+    log_error "            AGENTICSEC_BASEURL='$DEFAULT_BASEURL' \\"
+    log_error "            sh agenticsec-install.sh"
+}
+
+# プロンプトを出して1行読む。読めた値は標準出力に返す。
+# タイムアウトした場合は timeout(1) の終了コード 124 を返す。
+#
+# NOTE: 呼び出し側はコマンド置換で受けるため、プロンプトは標準出力ではなく
+#       /dev/tty へ直接書く。標準出力に書くと、プロンプト文字列まで
+#       戻り値として取り込まれてしまい、画面にも表示されない。
+prompt_read() {
+    printf "%s" "$1" > /dev/tty
+    if [ -n "$TIMEOUT_FG" ]; then
+        # shellcheck disable=SC2086
+        $TIMEOUT_FG "$INPUT_TIMEOUT_SEC" sh -c 'IFS= read -r _v < /dev/tty && printf "%s" "$_v"'
+    else
+        # timeout --foreground が使えない環境では従来どおり待つ
+        IFS= read -r _v < /dev/tty && printf "%s" "$_v"
+    fi
+}
+
 # クリーンアップ関数（インストール失敗時）
 cleanup_on_error() {
     log_error "Installation failed. Cleaning up..."
@@ -220,6 +351,28 @@ if ! "$DOCKER_BIN" info > /dev/null 2>&1; then
 fi
 log_info "✓ Docker daemon is running"
 
+# 2.5 通信先の到達性チェック
+#
+# インストールには api.agenticsec.tech 以外にも GitHub / GHCR / Docker Hub への
+# HTTPS 通信が必要。ここで落ちていないと、後段の docker pull が長時間ハングし、
+# 利用者からは原因が全く見えない形で止まる。
+log_info "Checking network reachability..."
+UNREACHABLE=0
+check_endpoint "GitHub (installer & release)" "https://github.com"           || UNREACHABLE=1
+check_endpoint "GHCR (supervisor image)"      "https://ghcr.io/v2/"          || UNREACHABLE=1
+check_endpoint "Docker Hub (fluent-bit)"      "https://registry-1.docker.io/v2/" || UNREACHABLE=1
+
+if [ "$UNREACHABLE" -ne 0 ]; then
+    log_error "Cannot reach the endpoints required for installation"
+    log_error "  (インストールに必要な通信先に到達できません)"
+    log_error ""
+    log_error "Allow HTTPS outbound access to the hosts marked with x above."
+    log_error "In a proxy environment, the Docker daemon needs its own proxy settings:"
+    log_error "  sudo systemctl show docker --property=Environment"
+    exit 1
+fi
+log_info "✓ Required endpoints are reachable"
+
 # Pre-install: Clean up legacy rapidpen-* resources
 log_info "Checking for legacy rapidpen-* resources..."
 cleanup_legacy_services
@@ -284,57 +437,82 @@ log_info "Configuring AgenticSec Cloud connection..."
 
 # API Key入力（必須）
 if [ -n "$AGENTICSEC_API_KEY" ]; then
-    # 環境変数から取得（テスト用）
+    # 環境変数から取得（非対話インストール）
     log_info "  Using API Key from environment variable"
 else
-    # ユーザーから入力（TTYが必要）
-    if [ ! -e /dev/tty ]; then
-        log_error "No TTY available and AGENTICSEC_API_KEY environment variable is not set"
-        log_error "  For non-interactive environments (e.g. cloud-init), set the environment variable:"
-        log_error "    export AGENTICSEC_API_KEY='your-api-key'"
+    # ユーザーから入力（制御端末が必要）
+    if ! tty_available; then
+        log_error "No terminal available for input, and AGENTICSEC_API_KEY is not set"
+        log_error "  For non-interactive environments (e.g. cloud-init), set the environment variables:"
+        log_error "    sudo AGENTICSEC_API_KEY='your-api-key' \\"
+        log_error "         AGENTICSEC_BASEURL='$DEFAULT_BASEURL' \\"
+        log_error "         sh agenticsec-install.sh"
         exit 1
     fi
+
+    ensure_tty_input_sane
     echo ""
     echo "Please enter your AgenticSec Cloud API Key:"
     echo "(You can obtain this from AgenticSec Cloud Web UI)"
-    printf "API Key: "
-    read -r AGENTICSEC_API_KEY < /dev/tty
 
-    # 空チェック
-    while [ -z "$AGENTICSEC_API_KEY" ]; do
-        log_error "API Key cannot be empty"
-        printf "API Key: "
-        read -r AGENTICSEC_API_KEY < /dev/tty
+    while : ; do
+        # NOTE: 終了コードは `||` の右辺で取る。`if cmd; then ...; fi` の後の $? は
+        #       条件コマンドの結果ではなく if 文自体の結果（0）になってしまう。
+        _read_rc=0
+        AGENTICSEC_API_KEY=$(prompt_read "API Key: ") || _read_rc=$?
+
+        if [ "$_read_rc" -eq 0 ]; then
+            [ -n "$AGENTICSEC_API_KEY" ] && break
+            echo ""
+            log_error "API Key cannot be empty"
+            continue
+        fi
+
+        # 読み取れなかった: タイムアウト(124) か EOF/端末エラー。
+        # どちらも「待ち続けても状況は変わらない」ので、原因と復旧手順を出して止める。
+        restore_tty
+        echo ""
+        if [ "$_read_rc" -eq 124 ]; then
+            log_error "Timed out after ${INPUT_TIMEOUT_SEC}s waiting for the API Key."
+            log_error "(API キーの入力を ${INPUT_TIMEOUT_SEC} 秒待ちましたが受け取れませんでした)"
+        fi
+        input_failure_help
+        exit 1
     done
 
+    restore_tty
     log_info "  API Key configured"
 fi
 
 # Base URL入力（オプション、デフォルト値あり）
-DEFAULT_BASEURL="https://api.agenticsec.tech/api/edge/supervisor"
-
 if [ -n "$AGENTICSEC_BASEURL" ]; then
-    # 環境変数から取得（テスト用）
+    # 環境変数から取得（非対話インストール）
     log_info "  Using Base URL from environment variable: $AGENTICSEC_BASEURL"
+elif ! tty_available; then
+    AGENTICSEC_BASEURL="$DEFAULT_BASEURL"
+    log_info "  No terminal available, using default base URL: $AGENTICSEC_BASEURL"
 else
-    # ユーザーから入力（TTYが必要、無い場合はデフォルト値を使用）
-    if [ ! -e /dev/tty ]; then
-        AGENTICSEC_BASEURL="$DEFAULT_BASEURL"
-        log_info "  No TTY available, using default base URL: $AGENTICSEC_BASEURL"
-    else
-        echo ""
-        echo "AgenticSec Cloud Base URL (default: $DEFAULT_BASEURL)"
-        echo "(Press Enter to use default, or enter custom URL)"
-        printf "Base URL: "
-        read -r AGENTICSEC_BASEURL < /dev/tty
+    ensure_tty_input_sane
+    echo ""
+    echo "AgenticSec Cloud Base URL (default: $DEFAULT_BASEURL)"
+    echo "(Press Enter to use default, or enter custom URL)"
 
-        # 空の場合はデフォルト値を使用
+    # Base URL は既定値があるため、読めなかった場合も止めずに既定値で続行する
+    if AGENTICSEC_BASEURL=$(prompt_read "Base URL: "); then
+        restore_tty
         if [ -z "$AGENTICSEC_BASEURL" ]; then
             AGENTICSEC_BASEURL="$DEFAULT_BASEURL"
             log_info "  Using default base URL: $AGENTICSEC_BASEURL"
         else
             log_info "  Using custom base URL: $AGENTICSEC_BASEURL"
         fi
+    else
+        restore_tty
+        echo ""
+        log_warn "Could not read Base URL from the terminal; using the default"
+        log_warn "  (Base URL を読み取れなかったため既定値を使用します)"
+        AGENTICSEC_BASEURL="$DEFAULT_BASEURL"
+        log_info "  Using default base URL: $AGENTICSEC_BASEURL"
     fi
 fi
 
@@ -417,18 +595,28 @@ SUPERVISOR_IMAGE="ghcr.io/agenticsec/agenticsec-supervisor:$SUPERVISOR_VERSION"
 log_info "Supervisor image: $SUPERVISOR_IMAGE"
 
 # Supervisorイメージをpull
-log_info "Pulling supervisor image (this may take a moment)..."
-PULL_OUTPUT=$(docker pull "$SUPERVISOR_IMAGE" 2>&1) || {
-    log_error "Failed to pull supervisor image: $SUPERVISOR_IMAGE"
-    log_error "  Docker error: $(echo "$PULL_OUTPUT" | tail -3)"
+# 進捗は docker pull にそのまま出力させる。出力を変数に取り込むと、
+# 数分かかる取得中に画面が完全に無反応となり、停止と区別できなくなる。
+log_info "Pulling supervisor image (this may take a few minutes)..."
+if ! run_with_timeout "$PULL_TIMEOUT_SEC" docker pull "$SUPERVISOR_IMAGE"; then
+    _pull_rc=$?
+    if [ "$_pull_rc" -eq 124 ]; then
+        log_error "Timed out after ${PULL_TIMEOUT_SEC}s while pulling $SUPERVISOR_IMAGE"
+        log_error "  (イメージ取得がタイムアウトしました)"
+        log_error "  ghcr.io に到達できていない可能性があります。"
+        log_error "  プロキシ環境では docker daemon 側にもプロキシ設定が必要です:"
+        log_error "    sudo systemctl show docker --property=Environment"
+    else
+        log_error "Failed to pull supervisor image: $SUPERVISOR_IMAGE"
+    fi
     log_error ""
     log_error "Please check:"
-    log_error "  - Internet connection"
+    log_error "  - Internet connection (ghcr.io)"
     log_error "  - Docker daemon is running: sudo systemctl status docker"
     log_error "  - The image tag '$SUPERVISOR_VERSION' exists"
     cleanup_on_error
     exit 1
-}
+fi
 log_info "✓ Image pulled successfully"
 
 # 7. state.jsonのimage_tagを更新
@@ -687,13 +875,18 @@ INGESTOR_CONF_EOF
             systemctl enable agenticsec-fluent-bit
             log_info "  Enabled agenticsec-fluent-bit service (auto-start on boot)"
 
-            # Fluent Bitイメージをpull
+            # Fluent Bitイメージをpull（進捗はそのまま表示する）
             log_info "Pulling Fluent Bit image..."
-            FB_PULL_OUTPUT=$(docker pull fluent/fluent-bit:latest 2>&1) || {
-                log_warn "Failed to pull Fluent Bit image"
-                log_warn "  Docker error: $(echo "$FB_PULL_OUTPUT" | tail -2)"
+            if ! run_with_timeout "$PULL_TIMEOUT_SEC" docker pull fluent/fluent-bit:latest; then
+                _fb_rc=$?
+                if [ "$_fb_rc" -eq 124 ]; then
+                    log_warn "Timed out after ${PULL_TIMEOUT_SEC}s while pulling fluent/fluent-bit:latest"
+                    log_warn "  registry-1.docker.io に到達できていない可能性があります"
+                else
+                    log_warn "Failed to pull Fluent Bit image"
+                fi
                 log_warn "  Service will attempt to pull on first start"
-            }
+            fi
             if docker image inspect fluent/fluent-bit:latest > /dev/null 2>&1; then
                 log_info "  ✓ Fluent Bit image ready"
             fi
