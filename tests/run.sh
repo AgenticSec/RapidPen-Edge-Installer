@@ -3,7 +3,7 @@
 #
 #   ./tests/run.sh                        全ケースを既定のベースイメージで実行
 #   ./tests/run.sh --base debian:12       ベースイメージを指定
-#   ./tests/run.sh interactive-normal     ケースを指定（複数可）
+#   ./tests/run.sh with-env               ケースを指定（複数可）
 #
 # 必要なもの: docker, expect, ネットワーク（インストーラが GitHub Release を引くため）
 set -eu
@@ -14,7 +14,7 @@ REPO_ROOT=$(cd "$TESTS_DIR/.." && pwd)
 BASE_IMAGE="${BASE_IMAGE:-ubuntu:22.04}"
 IMAGE_TAG="agenticsec-edge-installer-tests"
 
-ALL_CASES="interactive-normal interactive-no-icrnl interactive-trim input-timeout non-interactive no-tty"
+ALL_CASES="with-env with-env-no-tty missing-api-key no-tty"
 
 # 既知の失敗。ここに載ったケースは、落ちても全体を赤にせず XFAIL として報告する。
 # 不具合を修正する PR では、このリストから該当ケースを外して PASS を示すこと。
@@ -43,27 +43,22 @@ done
 echo "== building test image ($BASE_IMAGE)"
 docker build -q --build-arg "BASE=$BASE_IMAGE" -t "$IMAGE_TAG" "$TESTS_DIR" > /dev/null
 
-# --- 対話を伴わないケース ---------------------------------------------------
+# --- 端末を必要としないケース -----------------------------------------------
 
-# 環境変数を渡した場合に、入力を求めずインストールが進むこと
-run_non_interactive() {
+# 制御端末が無くても、設定が渡っていればインストールが進むこと
+# （構成管理ツールから実行される状況）
+run_with_env_no_tty() {
     _out=$(docker run --rm -i -v "$REPO_ROOT:/src:ro" "$IMAGE_TAG" \
-               sh /src/tests/case.sh non-interactive 2>&1) || true
+               sh /src/tests/case.sh with-env-no-tty 2>&1) || true
     printf '%s\n' "$_out"
 
-    if printf '%s' "$_out" | grep -q 'API Key: '; then
-        printf '\n>>> FAIL: 環境変数を渡したのに入力を求められた\n'; return 1
-    fi
-    if ! printf '%s' "$_out" | grep -q 'Using API Key from environment variable'; then
-        printf '\n>>> FAIL: 環境変数の API キーが使われなかった\n'; return 1
-    fi
     if ! printf '%s' "$_out" | grep -qF 'STORED_API_KEY[testkey123]'; then
-        printf '\n>>> FAIL: API キーが正しく保存されていない\n'; return 1
+        printf '\n>>> FAIL: API キーが保存されていない\n'; return 1
     fi
-    printf '\n>>> PASS: 無入力でインストールが進んだ\n'
+    printf '\n>>> PASS: 端末が無くても設定が渡っていれば進む\n'
 }
 
-# 制御端末も環境変数も無い場合に、黙って失敗せず代替手段を案内すること
+# 制御端末も設定も無い場合に、黙って失敗せず取得方法を案内すること
 run_no_tty() {
     # -t を付けない = 制御端末を持たないプロセスとして実行する
     _out=$(docker run --rm -i -v "$REPO_ROOT:/src:ro" "$IMAGE_TAG" \
@@ -71,19 +66,22 @@ run_no_tty() {
     printf '%s\n' "$_out"
 
     if printf '%s' "$_out" | grep -q 'installer exited with 0'; then
-        printf '\n>>> FAIL: 端末も環境変数も無いのに成功扱いになった\n'; return 1
+        printf '\n>>> FAIL: 設定が無いのに成功扱いになった\n'; return 1
     fi
-    if ! printf '%s' "$_out" | grep -q 'AGENTICSEC_API_KEY'; then
-        printf '\n>>> FAIL: 環境変数による代替手段が案内されていない\n'; return 1
+    if ! printf '%s' "$_out" | grep -q 'AGENTICSEC_API_KEY is not set'; then
+        printf '\n>>> FAIL: 設定不足である旨が案内されていない\n'; return 1
     fi
-    printf '\n>>> PASS: 明示的なエラーと代替手段の案内が出た\n'
+    if ! printf '%s' "$_out" | grep -q 'Pentest Edge'; then
+        printf '\n>>> FAIL: Web UI からの取得方法が案内されていない\n'; return 1
+    fi
+    printf '\n>>> PASS: 明示的なエラーと取得方法の案内が出た\n'
 }
 
 run_case() {
     case "$1" in
-        interactive-* | input-timeout)
+        with-env | missing-api-key)
             expect "$TESTS_DIR/drive.exp" "$1" "$IMAGE_TAG" "$REPO_ROOT" ;;
-        non-interactive) run_non_interactive ;;
+        with-env-no-tty) run_with_env_no_tty ;;
         no-tty)          run_no_tty ;;
         *) echo "unknown case: $1" >&2; return 2 ;;
     esac
