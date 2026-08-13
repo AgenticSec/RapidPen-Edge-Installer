@@ -18,7 +18,7 @@ ALL_CASES="interactive-normal interactive-no-icrnl interactive-trim input-timeou
 
 # 既知の失敗。ここに載ったケースは、落ちても全体を赤にせず XFAIL として報告する。
 # 不具合を修正する PR では、このリストから該当ケースを外して PASS を示すこと。
-XFAIL_CASES="interactive-no-icrnl input-timeout no-tty"
+XFAIL_CASES=""
 
 # --- 引数 -------------------------------------------------------------------
 
