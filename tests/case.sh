@@ -4,8 +4,8 @@
 #
 #   $1: ケース名
 #
-# 実行後、生成された state.json から API キーを取り出して STORED_API_KEY[...] を
-# 出力する。expect 側はこの行を見て、入力値が正しく保存されたかを判定する。
+# 実行後、生成された state.json から設定値を取り出して STORED_* を出力する。
+# 呼び出し側はこの行を見て、設定が正しく保存されたかを判定する。
 set -u
 
 CASE_NAME="$1"
@@ -27,21 +27,11 @@ while [ ! -S /var/run/docker.sock ] && [ "$i" -lt 500 ]; do i=$((i + 1)); done
 
 SUDO_ENV=""
 case "$CASE_NAME" in
-    interactive-normal | interactive-trim)
-        : ;;
-    interactive-no-icrnl)
-        # 顧客環境で観測された状態: 端末が CR を NL に変換しない。
-        # 打鍵は端末のエコーで画面に出るが read には改行が届かない。
-        stty -icrnl < /dev/tty ;;
-    input-timeout)
-        # 入力が全く届かない状況。無言で待ち続けないことを確認するため、
-        # 待ち時間を短くして実行する。
-        SUDO_ENV="AGENTICSEC_INPUT_TIMEOUT_SEC=5" ;;
-    non-interactive)
+    with-env | with-env-no-tty)
+        # 正常系。Web UI が配布するインストーラと同じく、設定を環境変数で渡す。
         SUDO_ENV="AGENTICSEC_API_KEY=$TEST_API_KEY AGENTICSEC_BASEURL=$TEST_BASEURL" ;;
-    no-tty)
-        # 制御端末なしで起動される（docker run に -t を付けない）。
-        # 環境変数も渡さないので、インストーラは対話入力に頼れない。
+    missing-api-key | no-tty)
+        # 設定が無い場合。案内を出して直ちに終了することを期待する。
         : ;;
     *)
         echo "unknown case: $CASE_NAME" >&2

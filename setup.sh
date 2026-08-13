@@ -20,35 +20,28 @@ log_warn() {
     printf "${YELLOW}[WARN]${NC} %s\n" "$1"
 }
 
-# --- 対話入力まわり ---------------------------------------------------------
+# --- 設定と共通ヘルパー -----------------------------------------------------
 #
-# インストーラは API キーを端末から読む。ここは以下の理由で壊れやすいので、
-# 「無言で待ち続けない」ことを最優先に組み立てている。
+# このインストーラは対話入力を行わない。設定は環境変数で受け取る。
 #
-#   - /dev/tty はデバイスファイルとして常に存在するため、その存在確認だけでは
-#     制御端末の有無を判定できない（実際に open して確かめる必要がある）
-#   - 端末の icrnl（CR->NL 変換）が落ちていると Enter キーが改行として read に
-#     届かない。打鍵した文字は端末のエコーで画面に見えるため、利用者からは
-#     「入力したのに何も起きない」ようにしか見えず、原因にたどり着けない
+# 端末から読む方式は sudo の pty 実装に依存しており、環境によって壊れる。
+# sudo が use_pty で作る擬似端末のフォアグラウンドプロセスグループを子プロセスに
+# 設定しない場合（Ubuntu 26.04 で確認）、インストーラはバックグラウンド
+# プロセスグループのまま端末を読むことになり SIGTTIN で停止する。このとき
+# 打鍵した文字は端末のエコーで画面に出るため、利用者からは「入力しているのに
+# 反応がない」ようにしか見えず、原因にたどり着けないまま待ち続けることになる。
 #
-INSTALL_URL="https://raw.githubusercontent.com/AgenticSec/AgenticSec-Edge-Installer/main/install.sh"
+# 端末に触れなければこの問題は起こり得ないので、対話入力そのものを廃止した。
+# API キーを埋め込んだインストーラを Web UI から取得できる。
+#
+WEB_UI_URL="https://app.agenticsec.tech"
 DEFAULT_BASEURL="https://api.agenticsec.tech/api/edge/supervisor"
-INPUT_TIMEOUT_SEC="${AGENTICSEC_INPUT_TIMEOUT_SEC:-120}"
 PULL_TIMEOUT_SEC="${AGENTICSEC_PULL_TIMEOUT_SEC:-900}"
-SAVED_STTY=""
 
-# timeout(1) の利用可否。
-#   TIMEOUT_BIN: 一般用途（イメージ取得など）
-#   TIMEOUT_FG : 端末入力を待つ用途。--foreground が無いと timeout 配下の
-#                コマンドは別プロセスグループで動き、端末からの read が
-#                SIGTTIN で停止してしまう。使える場合のみ設定する。
+# timeout(1) があれば使う（イメージ取得の頭打ち用）
 TIMEOUT_BIN=""
-TIMEOUT_FG=""
 if command -v timeout > /dev/null 2>&1; then
     TIMEOUT_BIN="timeout"
-    if timeout --foreground 1 true > /dev/null 2>&1; then
-        TIMEOUT_FG="timeout --foreground"
-    fi
 fi
 
 # timeout(1) があれば使い、無ければそのまま実行する。
@@ -61,90 +54,6 @@ run_with_timeout() {
         $TIMEOUT_BIN "$_rwt_sec" "$@"
     else
         "$@"
-    fi
-}
-
-# 制御端末を実際に open できるか（存在確認では不十分）
-#
-# NOTE: リダイレクトは必ずサブシェルの中で行う。`: < /dev/tty` をそのまま書くと、
-#       `:` は POSIX の特殊組み込みコマンドであるため、リダイレクトに失敗した
-#       時点で set -e の有無に関わらずシェル自体が終了してしまう。
-#       それでは「開けるかどうかを調べる」関数にならない。
-tty_available() {
-    ( : < /dev/tty ) 2>/dev/null
-}
-
-# icrnl が有効か
-tty_icrnl_enabled() {
-    command -v stty > /dev/null 2>&1 || return 1
-    tty_available || return 1
-    stty -a < /dev/tty 2>/dev/null | tr ' ;' '\n\n' | grep -qx 'icrnl'
-}
-
-# 対話入力の間だけ端末を入力可能な状態にする（終了時に restore_tty で戻す）
-ensure_tty_input_sane() {
-    tty_available || return 0
-    command -v stty > /dev/null 2>&1 || return 0
-    SAVED_STTY=$(stty -g < /dev/tty 2>/dev/null) || SAVED_STTY=""
-    # 途中でエラー終了したり Ctrl-C で中断されたりしても、端末設定を残さない
-    trap 'restore_tty' EXIT
-    trap 'restore_tty; exit 130' INT
-    trap 'restore_tty; exit 143' TERM
-    if ! tty_icrnl_enabled; then
-        log_warn "  Terminal has icrnl disabled; enabling it so that Enter is accepted"
-        log_warn "  (端末の改行変換が無効なため、入力を受け付けるよう一時的に有効化します)"
-    fi
-    stty icrnl < /dev/tty 2>/dev/null || true
-}
-
-restore_tty() {
-    [ -n "$SAVED_STTY" ] || return 0
-    stty "$SAVED_STTY" < /dev/tty 2>/dev/null || true
-    SAVED_STTY=""
-}
-
-# 入力を受け取れなかったときの診断情報
-tty_diagnostics() {
-    # tty(1) は標準入力を見るため、必ず制御端末を渡して判定する
-    _diag_tty=$(tty < /dev/tty 2>/dev/null) || _diag_tty="(none)"
-    if [ -t 0 ]; then _diag_stdin="terminal"; else _diag_stdin="pipe/redirect"; fi
-    if tty_icrnl_enabled; then _diag_icrnl="enabled"; else _diag_icrnl="DISABLED"; fi
-    log_error "    tty=$_diag_tty  stdin=$_diag_stdin  icrnl=$_diag_icrnl"
-}
-
-# 入力を受け取れなかったときの復旧手順
-input_failure_help() {
-    log_error ""
-    log_error "The installer could not read your input from the terminal."
-    log_error "(端末からの入力を受け取れませんでした)"
-    tty_diagnostics
-    log_error ""
-    log_error "Try either of the following / 次のいずれかをお試しください:"
-    log_error "  1) Reset the terminal, then run the installer again:"
-    log_error "       stty sane"
-    log_error "  2) Install without interactive input:"
-    log_error "       curl -fsSL $INSTALL_URL -o agenticsec-install.sh"
-    log_error "       sudo AGENTICSEC_API_KEY='<your-api-key>' \\"
-    log_error "            AGENTICSEC_BASEURL='$DEFAULT_BASEURL' \\"
-    log_error "            sh agenticsec-install.sh"
-}
-
-# プロンプトを出して1行読む。読めた値は標準出力に返す。
-# タイムアウトした場合は timeout(1) の終了コード 124 を返す。
-#
-# NOTE: 呼び出し側はコマンド置換で受けるため、プロンプトは標準出力ではなく
-#       /dev/tty へ直接書く。標準出力に書くと、プロンプト文字列まで
-#       戻り値として取り込まれてしまい、画面にも表示されない。
-# NOTE: IFS は既定のままにしておく。`IFS= read` にすると入力の前後の空白が
-#       そのまま残り、貼り付け時に混入した空白付きの API キーを保存してしまう。
-prompt_read() {
-    printf "%s" "$1" > /dev/tty
-    if [ -n "$TIMEOUT_FG" ]; then
-        # shellcheck disable=SC2086
-        $TIMEOUT_FG "$INPUT_TIMEOUT_SEC" sh -c 'read -r _v < /dev/tty && printf "%s" "$_v"'
-    else
-        # timeout --foreground が使えない環境では従来どおり待つ
-        read -r _v < /dev/tty && printf "%s" "$_v"
     fi
 }
 
@@ -407,88 +316,39 @@ else
     exit 1
 fi
 
-# 5. AgenticSec Cloud接続情報の入力
+# 5. AgenticSec Cloud 接続情報
+#
+# 対話入力は行わない（理由は冒頭の設定ブロックのコメントを参照）。
+# 設定は環境変数で受け取る。
 log_info "Configuring AgenticSec Cloud connection..."
 
-# API Key入力（必須）
-if [ -n "$AGENTICSEC_API_KEY" ]; then
-    # 環境変数から取得（非対話インストール）
-    log_info "  Using API Key from environment variable"
-else
-    # ユーザーから入力（制御端末が必要）
-    if ! tty_available; then
-        log_error "No terminal available for input, and AGENTICSEC_API_KEY is not set"
-        log_error "  For non-interactive environments (e.g. cloud-init), set the environment variables:"
-        log_error "    sudo AGENTICSEC_API_KEY='your-api-key' \\"
-        log_error "         AGENTICSEC_BASEURL='$DEFAULT_BASEURL' \\"
-        log_error "         sh agenticsec-install.sh"
-        exit 1
-    fi
-
-    ensure_tty_input_sane
-    echo ""
-    echo "Please enter your AgenticSec Cloud API Key:"
-    echo "(You can obtain this from AgenticSec Cloud Web UI)"
-
-    while : ; do
-        # NOTE: 終了コードは `||` の右辺で取る。`if cmd; then ...; fi` の後の $? は
-        #       条件コマンドの結果ではなく if 文自体の結果（0）になってしまう。
-        _read_rc=0
-        AGENTICSEC_API_KEY=$(prompt_read "API Key: ") || _read_rc=$?
-
-        if [ "$_read_rc" -eq 0 ]; then
-            [ -n "$AGENTICSEC_API_KEY" ] && break
-            echo ""
-            log_error "API Key cannot be empty"
-            continue
-        fi
-
-        # 読み取れなかった: タイムアウト(124) か EOF/端末エラー。
-        # どちらも「待ち続けても状況は変わらない」ので、原因と復旧手順を出して止める。
-        restore_tty
-        echo ""
-        if [ "$_read_rc" -eq 124 ]; then
-            log_error "Timed out after ${INPUT_TIMEOUT_SEC}s waiting for the API Key."
-            log_error "(API キーの入力を ${INPUT_TIMEOUT_SEC} 秒待ちましたが受け取れませんでした)"
-        fi
-        input_failure_help
-        exit 1
-    done
-
-    restore_tty
-    log_info "  API Key configured"
+if [ -z "$AGENTICSEC_API_KEY" ]; then
+    log_error "AGENTICSEC_API_KEY is not set"
+    log_error "(AGENTICSEC_API_KEY が設定されていません)"
+    log_error ""
+    log_error "This installer does not prompt for input."
+    log_error "(このインストーラは入力を求めません)"
+    log_error ""
+    log_error "Download the installer from the Web UI. It already contains your"
+    log_error "API key, so nothing needs to be typed in:"
+    log_error "(Web UI からインストーラを取得してください。API キーが埋め込まれており、"
+    log_error " 入力は不要です)"
+    log_error "  $WEB_UI_URL  ->  Pentest Edge"
+    log_error ""
+    log_error "Alternatively, set the variables yourself:"
+    log_error "(または環境変数を指定してください)"
+    log_error "  sudo AGENTICSEC_API_KEY='<your-api-key>' \\"
+    log_error "       AGENTICSEC_BASEURL='$DEFAULT_BASEURL' \\"
+    log_error "       sh agenticsec-install.sh"
+    exit 1
 fi
+log_info "  API Key configured"
 
-# Base URL入力（オプション、デフォルト値あり）
-if [ -n "$AGENTICSEC_BASEURL" ]; then
-    # 環境変数から取得（非対話インストール）
-    log_info "  Using Base URL from environment variable: $AGENTICSEC_BASEURL"
-elif ! tty_available; then
+if [ -z "$AGENTICSEC_BASEURL" ]; then
     AGENTICSEC_BASEURL="$DEFAULT_BASEURL"
-    log_info "  No terminal available, using default base URL: $AGENTICSEC_BASEURL"
+    log_info "  Using default base URL: $AGENTICSEC_BASEURL"
 else
-    ensure_tty_input_sane
-    echo ""
-    echo "AgenticSec Cloud Base URL (default: $DEFAULT_BASEURL)"
-    echo "(Press Enter to use default, or enter custom URL)"
-
-    # Base URL は既定値があるため、読めなかった場合も止めずに既定値で続行する
-    if AGENTICSEC_BASEURL=$(prompt_read "Base URL: "); then
-        restore_tty
-        if [ -z "$AGENTICSEC_BASEURL" ]; then
-            AGENTICSEC_BASEURL="$DEFAULT_BASEURL"
-            log_info "  Using default base URL: $AGENTICSEC_BASEURL"
-        else
-            log_info "  Using custom base URL: $AGENTICSEC_BASEURL"
-        fi
-    else
-        restore_tty
-        echo ""
-        log_warn "Could not read Base URL from the terminal; using the default"
-        log_warn "  (Base URL を読み取れなかったため既定値を使用します)"
-        AGENTICSEC_BASEURL="$DEFAULT_BASEURL"
-        log_info "  Using default base URL: $AGENTICSEC_BASEURL"
-    fi
+    log_info "  Using base URL: $AGENTICSEC_BASEURL"
 fi
 
 # 6. SupervisorState 初期ファイル作成（後でimage_tagを更新）
