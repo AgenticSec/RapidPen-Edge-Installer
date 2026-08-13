@@ -3,7 +3,8 @@
 #
 #   ./tests/lint.sh
 #
-# shellcheck が入っていない場合は構文チェックのみを行う。
+# なお shellcheck が入っていない場合は構文チェックのみを行う。
+# (行頭を "# shellcheck" で始めると shellcheck のディレクティブとして解釈される)
 set -eu
 
 TESTS_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -48,19 +49,19 @@ else
 fi
 
 if command -v shellcheck > /dev/null 2>&1; then
-    # まずは明確な誤りだけを止める水準から始める。
-    # 指摘を潰しながら段階的に引き上げていく想定。
-    echo "== shellcheck (severity: error)"
+    # 既存コードは warning まで指摘ゼロなので、その水準を維持する。
+    echo "== shellcheck (severity: warning)"
     # shellcheck disable=SC2086
-    if shellcheck -s sh -S error $SCRIPTS; then
+    if shellcheck -s sh -S warning $SCRIPTS; then
         echo "  ok"
     else
         status=1
     fi
 
-    echo "== shellcheck (severity: warning, 参考表示のみ)"
+    # info / style は件数が多くなりがちなので、止めずに参考表示に留める。
+    echo "== shellcheck (severity: info, 参考表示のみ)"
     # shellcheck disable=SC2086
-    shellcheck -s sh -S warning $SCRIPTS || true
+    shellcheck -s sh -S info $SCRIPTS || true
 else
     echo "== shellcheck not installed; skipping"
 fi
