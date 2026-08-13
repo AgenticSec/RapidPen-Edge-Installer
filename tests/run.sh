@@ -1,0 +1,146 @@
+#!/bin/sh
+# Edge Installer の E2E テスト。
+#
+#   ./tests/run.sh                        全ケースを既定のベースイメージで実行
+#   ./tests/run.sh --base debian:12       ベースイメージを指定
+#   ./tests/run.sh interactive-normal     ケースを指定（複数可）
+#
+# 必要なもの: docker, expect, ネットワーク（インストーラが GitHub Release を引くため）
+set -eu
+
+TESTS_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$TESTS_DIR/.." && pwd)
+
+BASE_IMAGE="${BASE_IMAGE:-ubuntu:22.04}"
+IMAGE_TAG="agenticsec-edge-installer-tests"
+
+ALL_CASES="interactive-normal interactive-no-icrnl interactive-trim input-timeout non-interactive no-tty"
+
+# 既知の失敗。ここに載ったケースは、落ちても全体を赤にせず XFAIL として報告する。
+# 不具合を修正する PR では、このリストから該当ケースを外して PASS を示すこと。
+XFAIL_CASES="interactive-no-icrnl input-timeout no-tty"
+
+# --- 引数 -------------------------------------------------------------------
+
+CASES=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --base) BASE_IMAGE="$2"; shift 2 ;;
+        --base=*) BASE_IMAGE="${1#--base=}"; shift ;;
+        -h | --help) sed -n '2,9p' "$0"; exit 0 ;;
+        -*) echo "unknown option: $1" >&2; exit 2 ;;
+        *) CASES="$CASES $1"; shift ;;
+    esac
+done
+[ -n "$CASES" ] || CASES="$ALL_CASES"
+
+# --- 準備 -------------------------------------------------------------------
+
+for cmd in docker expect; do
+    command -v "$cmd" > /dev/null 2>&1 || { echo "$cmd is required" >&2; exit 2; }
+done
+
+echo "== building test image ($BASE_IMAGE)"
+docker build -q --build-arg "BASE=$BASE_IMAGE" -t "$IMAGE_TAG" "$TESTS_DIR" > /dev/null
+
+# --- 対話を伴わないケース ---------------------------------------------------
+
+# 環境変数を渡した場合に、入力を求めずインストールが進むこと
+run_non_interactive() {
+    _out=$(docker run --rm -i -v "$REPO_ROOT:/src:ro" "$IMAGE_TAG" \
+               sh /src/tests/case.sh non-interactive 2>&1) || true
+    printf '%s\n' "$_out"
+
+    if printf '%s' "$_out" | grep -q 'API Key: '; then
+        printf '\n>>> FAIL: 環境変数を渡したのに入力を求められた\n'; return 1
+    fi
+    if ! printf '%s' "$_out" | grep -q 'Using API Key from environment variable'; then
+        printf '\n>>> FAIL: 環境変数の API キーが使われなかった\n'; return 1
+    fi
+    if ! printf '%s' "$_out" | grep -qF 'STORED_API_KEY[testkey123]'; then
+        printf '\n>>> FAIL: API キーが正しく保存されていない\n'; return 1
+    fi
+    printf '\n>>> PASS: 無入力でインストールが進んだ\n'
+}
+
+# 制御端末も環境変数も無い場合に、黙って失敗せず代替手段を案内すること
+run_no_tty() {
+    # -t を付けない = 制御端末を持たないプロセスとして実行する
+    _out=$(docker run --rm -i -v "$REPO_ROOT:/src:ro" "$IMAGE_TAG" \
+               sh /src/tests/case.sh no-tty 2>&1) || true
+    printf '%s\n' "$_out"
+
+    if printf '%s' "$_out" | grep -q 'installer exited with 0'; then
+        printf '\n>>> FAIL: 端末も環境変数も無いのに成功扱いになった\n'; return 1
+    fi
+    if ! printf '%s' "$_out" | grep -q 'AGENTICSEC_API_KEY'; then
+        printf '\n>>> FAIL: 環境変数による代替手段が案内されていない\n'; return 1
+    fi
+    printf '\n>>> PASS: 明示的なエラーと代替手段の案内が出た\n'
+}
+
+run_case() {
+    case "$1" in
+        interactive-* | input-timeout)
+            expect "$TESTS_DIR/drive.exp" "$1" "$IMAGE_TAG" "$REPO_ROOT" ;;
+        non-interactive) run_non_interactive ;;
+        no-tty)          run_no_tty ;;
+        *) echo "unknown case: $1" >&2; return 2 ;;
+    esac
+}
+
+is_xfail() {
+    for _x in $XFAIL_CASES; do
+        [ "$_x" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# --- 実行 -------------------------------------------------------------------
+
+n_pass=0
+n_fail=0
+n_xfail=0
+n_xpass=0
+summary=""
+
+for case_name in $CASES; do
+    echo
+    echo "======================================================================"
+    echo "== $case_name  ($BASE_IMAGE)"
+    echo "======================================================================"
+
+    if run_case "$case_name"; then
+        _rc=0
+    else
+        _rc=$?
+    fi
+
+    if is_xfail "$case_name"; then
+        if [ "$_rc" -eq 0 ]; then
+            n_xpass=$((n_xpass + 1))
+            summary="$summary\nXPASS  $case_name  (既知の失敗が解消。XFAIL_CASES から外すこと)"
+        else
+            n_xfail=$((n_xfail + 1))
+            summary="$summary\nXFAIL  $case_name  (既知の失敗)"
+        fi
+    else
+        if [ "$_rc" -eq 0 ]; then
+            n_pass=$((n_pass + 1))
+            summary="$summary\nPASS   $case_name"
+        else
+            n_fail=$((n_fail + 1))
+            summary="$summary\nFAIL   $case_name"
+        fi
+    fi
+done
+
+echo
+echo "======================================================================"
+echo "== 結果 ($BASE_IMAGE)"
+echo "======================================================================"
+printf '%b\n' "$summary"
+echo
+echo "PASS=$n_pass FAIL=$n_fail XFAIL=$n_xfail XPASS=$n_xpass"
+
+[ "$n_fail" -eq 0 ] || exit 1

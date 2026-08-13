@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 外部 Action はサプライチェーン攻撃対策としてコミット SHA でピニングする
+# (AgenticSec 本体の ADR-015 と同じ方針)
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install shellcheck and dash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck dash
+
+      - name: Lint shell scripts
+        run: ./tests/lint.sh
+
+  e2e:
+    name: e2e (${{ matrix.base }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        base:
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - debian:12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install expect
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq expect
+
+      - name: Run installer end-to-end tests
+        run: ./tests/run.sh --base ${{ matrix.base }}

@@ -1,0 +1,98 @@
+#!/usr/bin/expect -f
+# 実端末（pty）からインストーラを操作し、対話入力が意図どおり扱われるかを判定する。
+#
+#   argv0: ケース名  argv1: テスト用イメージ  argv2: リポジトリのルート
+#
+# 対話を伴わないケース（non-interactive / no-tty）は run.sh 側で扱う。
+
+set case_name [lindex $argv 0]
+set image     [lindex $argv 1]
+set repo_root [lindex $argv 2]
+
+proc verdict {status message} {
+    puts "\n>>> $status: $message"
+    if {$status eq "PASS"} { exit 0 }
+    exit 1
+}
+
+# 待ち時間はケースごとに変える。ハングを見るケースで長く待つと、
+# 失敗の確定にそのまま時間がかかるため。
+switch -- $case_name {
+    "interactive-trim" {
+        # state.json の生成まで進めるため、GitHub Release の取得などを待つ
+        set timeout 120
+    }
+    "input-timeout" {
+        # 入力待ちで止まり続けていないかを見る。
+        # インストーラ側の待ち時間 (AGENTICSEC_INPUT_TIMEOUT_SEC=5) より十分長く取る
+        set timeout 30
+    }
+    default {
+        # 入力が受け付けられるかだけを見るので、長く待つ必要はない
+        set timeout 45
+    }
+}
+
+spawn docker run --rm -i -t -v $repo_root:/src:ro $image sh /src/tests/case.sh $case_name
+
+switch -- $case_name {
+    "interactive-normal" -
+    "interactive-no-icrnl" {
+        expect {
+            "API Key: " {}
+            timeout { verdict FAIL "API キーのプロンプトが表示されなかった" }
+            eof     { verdict FAIL "プロンプトが出る前に終了した" }
+        }
+        send "testkey123\r"
+        expect {
+            "API Key configured" { verdict PASS "入力が受け付けられた" }
+            timeout { verdict FAIL "Enter を押しても入力が受け付けられない（ハング）" }
+            eof     { verdict FAIL "入力直後に終了した" }
+        }
+    }
+
+    "interactive-trim" {
+        expect {
+            "API Key: " {}
+            timeout { verdict FAIL "API キーのプロンプトが表示されなかった" }
+            eof     { verdict FAIL "プロンプトが出る前に終了した" }
+        }
+        # 末尾に空白を付けて入力する。コピー＆ペーストで混入しやすく、
+        # そのまま保存されると認証に失敗する。
+        send "testkey123   \r"
+        expect {
+            "Base URL: " { send "\r" }
+            timeout { verdict FAIL "Base URL のプロンプトが表示されなかった" }
+            eof     { verdict FAIL "API キー入力後に終了した" }
+        }
+        expect {
+            -re {STORED_API_KEY\[([^\]]*)\]} {
+                set stored $expect_out(1,string)
+                if {$stored eq "testkey123"} {
+                    verdict PASS "前後の空白が除去されて保存された"
+                }
+                verdict FAIL "API キーの空白が除去されていない: \[$stored\]"
+            }
+            "STATE_FILE_MISSING" { verdict FAIL "state.json が生成されなかった" }
+            timeout { verdict FAIL "state.json の検査まで到達しなかった" }
+            eof     { verdict FAIL "state.json の検査前に終了した" }
+        }
+    }
+
+    "input-timeout" {
+        expect {
+            "API Key: " {}
+            timeout { verdict FAIL "API キーのプロンプトが表示されなかった" }
+            eof     { verdict FAIL "プロンプトが出る前に終了した" }
+        }
+        # あえて何も入力しない。無言で待ち続けないことを確認する。
+        expect {
+            eof     { verdict PASS "入力が無い場合に有限時間で終了した" }
+            timeout { verdict FAIL "入力が無いまま待ち続けている（ハング）" }
+        }
+    }
+
+    default {
+        verdict FAIL "expect ドライバが扱わないケース: $case_name"
+    }
+}
